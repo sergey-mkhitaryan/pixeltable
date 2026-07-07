@@ -1,5 +1,6 @@
 import dataclasses
 import enum
+import gc
 import json
 import logging
 import os
@@ -9,6 +10,7 @@ import signal
 import sys
 import tempfile
 import time
+import tracemalloc
 from argparse import ArgumentParser
 from datetime import datetime
 from pathlib import Path
@@ -127,6 +129,347 @@ class RandomTableOpsConfig:
     random_img_freq: float = 0.1  # probability of including an image when inserting a row
 
 
+class _MemProfiler:
+    """
+    Optional memory-leak instrumentation for a worker, enabled via `PXT_RANDOM_OPS_MEMPROF=1`.
+
+    Every `interval_s` seconds it records, for the current process:
+    - a wide row of gauges to CSV (the growth *trend*): RSS, USS, Python-traced memory, allocated-block count,
+      live-object count, open FDs / files / sockets, Linux anon-heap size, and Catalog cache sizes;
+    - the top object types and allocation sites growing *since a fixed baseline* (the first sample), which is a
+      far cleaner accumulation signal than sample-to-sample deltas;
+    - a curated watch-list of catalog / SQLAlchemy / DB object types;
+    - a referrer-type histogram for the single fastest-growing type (what container is retaining it).
+
+    tracemalloc (Python-only, and heavy) can be disabled via `PXT_RANDOM_OPS_MEMPROF_TRACEMALLOC=0` to get an
+    undistorted RSS/USS reading alongside the native probes (FDs, sockets, anon heap) — that combination localizes
+    *native* leaks and fragmentation, which tracemalloc is blind to.
+
+    Output goes to `$PIXELTABLE_HOME/logs/random-ops-mem-{worker_id}.csv` and `-memprof-{worker_id}.log`.
+    Sampling forces a `gc.collect()` first, so growth reflects genuinely retained memory, not uncollected cycles.
+    """
+
+    # Types to dump a referrer histogram for (to find what container/registry is retaining them).
+    _REFERRER_TARGETS = ('Table', 'MetaData', 'DDLEventsDispatch', 'quoted_name', 'TableVersionHandle')
+
+    # Types worth watching explicitly every sample, regardless of ranking (catalog / SQLAlchemy / DB / exprs).
+    _WATCH_TYPES = (
+        'TableVersion',
+        'TableVersionHandle',
+        'TableVersionPath',
+        'Column',
+        'ColumnRef',
+        'QColumnId',
+        'ColumnMd',
+        'SchemaColumn',
+        'Expr',
+        'Table',
+        'MetaData',
+        'Connection',
+        'Engine',
+        'Cursor',
+        'CacheKey',
+        'StoreTable',
+        'StoreView',
+        'StoreComponentView',
+    )
+
+    def __init__(self, worker_id: int, interval_s: float) -> None:
+        self.worker_id = worker_id
+        self.interval_s = interval_s
+        self._start_ts = time.monotonic()
+        self._last_ts = 0.0
+        self._use_tracemalloc = os.environ.get('PXT_RANDOM_OPS_MEMPROF_TRACEMALLOC', '1') == '1'
+        self._prev_snapshot: tracemalloc.Snapshot | None = None
+        self._baseline_snapshot: tracemalloc.Snapshot | None = None
+        self._prev_type_counts: dict[str, int] = {}
+        self._baseline_type_counts: dict[str, int] = {}
+        try:
+            import psutil  # type: ignore[import-untyped]
+
+            self._proc: Any = psutil.Process()
+        except Exception:
+            self._proc = None
+
+        if self._use_tracemalloc:
+            tracemalloc.start(15)
+
+        log_dir = Config.get().home / 'logs'
+        os.makedirs(log_dir, exist_ok=True)
+        self._csv_path = log_dir / f'random-ops-mem-{worker_id}.csv'
+        self._log_path = log_dir / f'random-ops-memprof-{worker_id}.log'
+        with open(self._csv_path, 'w', encoding='utf-8') as f:
+            f.write(
+                'elapsed_s,iteration,rss_mb,uss_mb,traced_mb,py_blocks,gc_objects,'
+                'num_fds,open_files,sockets,anon_heap_mb,'
+                'tbl_versions,tbls,col_deps,col_dep_entries\n'
+            )
+
+    @staticmethod
+    def _catalog_sizes() -> dict[str, int]:
+        """Best-effort sizes of the Catalog singleton's per-process caches (to pinpoint an unbounded one)."""
+        try:
+            from pixeltable.catalog.catalog import Catalog
+            from pixeltable.catalog.path import ROOT_PATH
+            from pixeltable.runtime import get_runtime
+
+            cat = get_runtime()._catalogs.get(ROOT_PATH)
+            if not isinstance(cat, Catalog):
+                return {}
+            return {
+                'tbl_versions': len(cat._tbl_versions),
+                'tbls': len(cat._tbls),
+                'col_deps': len(cat._column_dependencies),
+                'col_dep_entries': sum(len(v) for v in cat._column_dependencies.values()),
+            }
+        except Exception:
+            return {}
+
+    @staticmethod
+    def _catalog_composition() -> str:
+        """Break down the Catalog caches into live working-set vs. retained-stale entries.
+
+        This is the decisive signal for the retention hypothesis (Path A). With ~4 base tables, the live
+        working set is small and bounded. If `old` (pinned non-current versions), `invalidated` (marked stale
+        but still cached), or `distinct_ids` (entries for dropped/recreated tables & views) climb over time while
+        `current` stays flat, the caches are accumulating garbage -- i.e. the leak. If everything stays flat, the
+        cache is a bounded working set and Path A is NOT the cause.
+        """
+        try:
+            from pixeltable.catalog.catalog import Catalog
+            from pixeltable.catalog.path import ROOT_PATH
+            from pixeltable.runtime import get_runtime
+
+            cat = get_runtime()._catalogs.get(ROOT_PATH)
+            if not isinstance(cat, Catalog):
+                return 'catalog composition: <unavailable>'
+
+            tv_items = list(cat._tbl_versions.items())
+            tv_current = sum(1 for k, _ in tv_items if k.effective_version is None)
+            tv_invalid = sum(1 for _, v in tv_items if not getattr(v, 'is_validated', True))
+            tv_ids = len({k.tbl_id for k, _ in tv_items})
+
+            tbl_items = list(cat._tbls.keys())
+            tbl_current = sum(1 for (_, ver) in tbl_items if ver is None)
+            tbl_ids = len({tid for (tid, _) in tbl_items})
+
+            return (
+                'catalog composition: '
+                f'tbl_versions[total={len(tv_items)} current={tv_current} old={len(tv_items) - tv_current} '
+                f'invalidated={tv_invalid} distinct_ids={tv_ids}] '
+                f'tbls[total={len(tbl_items)} current={tbl_current} distinct_ids={tbl_ids}] '
+                f'col_deps={len(cat._column_dependencies)}'
+            )
+        except Exception as e:
+            return f'catalog composition: <error: {e!r}>'
+
+    def _rss_mb(self) -> float:
+        if self._proc is not None:
+            return float(self._proc.memory_info().rss) / 1e6
+        import resource
+
+        # ru_maxrss: bytes on macOS, KiB on Linux
+        maxrss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        return maxrss / 1e6 if sys.platform == 'darwin' else maxrss / 1e3
+
+    def _os_probe(self) -> dict[str, float]:
+        """Native/OS-level gauges (tracemalloc is blind to these): USS, FDs, open files, sockets."""
+        d: dict[str, float] = {'rss_mb': self._rss_mb(), 'uss_mb': -1, 'num_fds': -1, 'open_files': -1, 'sockets': -1}
+        if self._proc is None:
+            return d
+        # Each probe is best-effort: some are unavailable or require privileges on certain platforms.
+        try:
+            d['uss_mb'] = self._proc.memory_full_info().uss / 1e6
+        except Exception:
+            pass
+        try:
+            d['num_fds'] = self._proc.num_fds()
+        except Exception:
+            pass
+        try:
+            d['open_files'] = len(self._proc.open_files())
+        except Exception:
+            pass
+        try:
+            d['sockets'] = len(self._proc.connections(kind='all'))
+        except Exception:
+            pass
+        return d
+
+    def _anon_heap_mb(self) -> float:
+        """RSS of anonymous/heap mappings (Linux only; the bulk of native malloc lives here). -1 elsewhere."""
+        if self._proc is None or sys.platform == 'darwin':
+            return -1.0
+        try:
+            total = 0
+            for m in self._proc.memory_maps(grouped=False):
+                if m.path == '' or m.path.startswith('[heap]') or m.path.startswith('[anon'):
+                    total += getattr(m, 'rss', 0)
+            return total / 1e6
+        except Exception:
+            return -1.0
+
+    @staticmethod
+    def _referrer_report(objs: list, type_name: str, max_sample: int = 400) -> list[str]:
+        """Histogram the direct-referrer types of `type_name` instances -- names the container retaining them.
+
+        Excludes the profiler's own scratch lists (objs/instances/sample) and the calling frame, which would
+        otherwise dominate the histogram as spurious 'list'/'frame' referrers.
+        """
+        instances = [o for o in objs if type(o).__name__ == type_name]
+        if not instances:
+            return []
+        sample = instances[:max_sample]
+        skip_ids = {id(objs), id(instances), id(sample)}
+        hist: dict[str, int] = {}
+        for ref in gc.get_referrers(*sample):
+            if id(ref) in skip_ids or type(ref).__name__ == 'frame':
+                continue
+            hist[type(ref).__name__] = hist.get(type(ref).__name__, 0) + 1
+        out = [f'  referrers of {type_name!r} (live={len(instances)}, sampled {len(sample)}):']
+        for rname, cnt in sorted(hist.items(), key=lambda kv: kv[1], reverse=True)[:8]:
+            out.append(f'    {cnt:>8d}  {rname}')
+        return out
+
+    @staticmethod
+    def _owner_trace(objs: list, type_name: str, max_sample: int = 200) -> list[str]:
+        """2-hop referrer trace: names the objects that own the containers referencing `type_name` instances.
+
+        Hop 1 finds the containers pointing at the instances (typically an instance `__dict__`); hop 2 finds who
+        owns those containers -- e.g. `MetaData` <- dict <- `StoreTable` (pixeltable holds it) vs. <- module
+        (a SQLAlchemy global). Scratch lists and frames are excluded at both hops.
+        """
+        instances = [o for o in objs if type(o).__name__ == type_name]
+        if not instances:
+            return []
+        sample = instances[:max_sample]
+        skip = {id(objs), id(instances), id(sample)}
+        containers = [r for r in gc.get_referrers(*sample) if id(r) not in skip and type(r).__name__ != 'frame']
+        container_sample = containers[:1000]
+        skip2 = skip | {id(containers), id(container_sample)}
+        hist: dict[str, int] = {}
+        for owner in gc.get_referrers(*container_sample):
+            if id(owner) in skip2 or type(owner).__name__ == 'frame':
+                continue
+            hist[type(owner).__name__] = hist.get(type(owner).__name__, 0) + 1
+        out = [f'  owner-trace of {type_name!r} (2-hop, sampled {len(sample)}, {len(containers)} containers):']
+        for oname, cnt in sorted(hist.items(), key=lambda kv: kv[1], reverse=True)[:10]:
+            out.append(f'    {cnt:>8d}  {oname}')
+        return out
+
+    @staticmethod
+    def _sqlalchemy_probe(objs: list) -> str:
+        """Direct test of the MetaData-registry hypothesis: how many SQLAlchemy Tables are pinned by MetaData."""
+        mds = [o for o in objs if type(o).__name__ == 'MetaData']
+        n_tables = [o for o in objs if type(o).__name__ == 'Table']
+        total_registered = 0
+        max_registered = 0
+        for md in mds:
+            tables = getattr(md, 'tables', None)
+            if tables is not None:
+                total_registered += len(tables)
+                max_registered = max(max_registered, len(tables))
+        return (
+            f'sa_metadata={len(mds)} sa_tables={len(n_tables)} '
+            f'registered_in_md={total_registered} max_tables_per_md={max_registered}'
+        )
+
+    def maybe_sample(self, iteration: int) -> None:
+        if time.monotonic() - self._last_ts >= self.interval_s:
+            self.sample(iteration)
+
+    def sample(self, iteration: int) -> None:
+        self._last_ts = time.monotonic()
+        gc.collect()
+        elapsed = time.monotonic() - self._start_ts
+
+        probe = self._os_probe()
+        rss_mb = probe['rss_mb']
+        uss_mb = probe['uss_mb']
+        anon_mb = self._anon_heap_mb()
+        py_blocks = sys.getallocatedblocks()
+        traced_mb = tracemalloc.get_traced_memory()[0] / 1e6 if self._use_tracemalloc else -1.0
+        cat = self._catalog_sizes()
+
+        objs = gc.get_objects()
+        n_objs = len(objs)
+        type_counts: dict[str, int] = {}
+        for o in objs:
+            tname = type(o).__name__
+            type_counts[tname] = type_counts.get(tname, 0) + 1
+
+        with open(self._csv_path, 'a', encoding='utf-8') as f:
+            f.write(
+                f'{elapsed:.0f},{iteration},{rss_mb:.1f},{uss_mb:.1f},{traced_mb:.1f},{py_blocks},{n_objs},'
+                f'{probe["num_fds"]:.0f},{probe["open_files"]:.0f},{probe["sockets"]:.0f},{anon_mb:.1f},'
+                f'{cat.get("tbl_versions", -1)},{cat.get("tbls", -1)},'
+                f'{cat.get("col_deps", -1)},{cat.get("col_dep_entries", -1)}\n'
+            )
+
+        cat_str = ' '.join(f'{k}={v}' for k, v in cat.items())
+        composition = self._catalog_composition()
+        lines: list[str] = [
+            f'[{datetime.now()}] elapsed={elapsed:.0f}s iter={iteration} '
+            f'rss={rss_mb:.1f}MB uss={uss_mb:.1f}MB anon_heap={anon_mb:.1f}MB traced={traced_mb:.1f}MB '
+            f'py_blocks={py_blocks} gc_objects={n_objs} '
+            f'fds={probe["num_fds"]:.0f} open_files={probe["open_files"]:.0f} sockets={probe["sockets"]:.0f} '
+            f'| catalog: {cat_str}',
+            f'  {composition}',
+            f'  sqlalchemy: {self._sqlalchemy_probe(objs)}',
+        ]
+
+        # Curated watch-list: current count and growth since the fixed baseline.
+        if self._baseline_type_counts:
+            watch = [
+                (t, type_counts.get(t, 0), type_counts.get(t, 0) - self._baseline_type_counts.get(t, 0))
+                for t in self._WATCH_TYPES
+                if type_counts.get(t, 0) > 0
+            ]
+            if watch:
+                lines.append('  watched types (count | Δbaseline):')
+                for tname, cnt, delta in watch:
+                    lines.append(f'    {cnt:>8d}  {delta:+8d}  {tname}')
+
+        # Top object types growing since the fixed baseline (cleaner accumulation signal than sample-to-sample).
+        if self._baseline_type_counts:
+            deltas = sorted(
+                ((t, type_counts[t] - self._baseline_type_counts.get(t, 0)) for t in type_counts),
+                key=lambda kv: kv[1],
+                reverse=True,
+            )
+            lines.append('  top growing object types since baseline (Δcount):')
+            for tname, delta in deltas[:15]:
+                if delta <= 0:
+                    break
+                lines.append(f'    {delta:+8d}  {tname} (now {type_counts[tname]})')
+        else:
+            self._baseline_type_counts = type_counts
+
+        # Referrer histograms for the curated target types: name the container/registry retaining them.
+        for target in self._REFERRER_TARGETS:
+            lines.extend(self._referrer_report(objs, target))
+        # 2-hop owner trace: is MetaData/Table held by a lingering StoreTable (pixeltable) or a SQLAlchemy global?
+        lines.extend(self._owner_trace(objs, 'MetaData'))
+        lines.extend(self._owner_trace(objs, 'Table'))
+        self._prev_type_counts = type_counts
+        del objs
+
+        # Top allocation sites growing since the fixed baseline (Python-only; requires tracemalloc).
+        if self._use_tracemalloc:
+            snapshot = tracemalloc.take_snapshot()
+            if self._baseline_snapshot is None:
+                self._baseline_snapshot = snapshot
+            else:
+                lines.append('  top growing allocation sites since baseline (Δsize):')
+                for stat in snapshot.compare_to(self._baseline_snapshot, 'lineno')[:15]:
+                    lines.append(f'    {stat}')
+            self._prev_snapshot = snapshot
+
+        with open(self._log_path, 'a', encoding='utf-8') as f:
+            f.write('\n'.join(lines) + '\n\n')
+        print(f'[MEMPROF w{self.worker_id}] {lines[0]}')
+
+
 class RandomTableOps:
     """
     Runs random table operations on a single worker.
@@ -175,6 +518,12 @@ class RandomTableOps:
         self._err_counts: dict[str, dict[str, int]] = {}  # op_name -> {sanitized_msg -> count}
         self._last_flush_ts: float = 0.0
         self.base_table_names = tuple(f'tbl_{i}' for i in range(config.num_base_tables))
+
+        # Optional memory-leak instrumentation, enabled via PXT_RANDOM_OPS_MEMPROF=1.
+        self._memprof: _MemProfiler | None = None
+        if os.environ.get('PXT_RANDOM_OPS_MEMPROF') == '1':
+            interval_s = float(os.environ.get('PXT_RANDOM_OPS_MEMPROF_INTERVAL', '60'))
+            self._memprof = _MemProfiler(worker_id, interval_s)
 
         selected_ops: set[str]
         if include_only_ops:
@@ -441,9 +790,40 @@ class RandomTableOps:
 
     def run(self) -> None:
         """Run random table operations indefinitely."""
+        iteration = 0
+        # Test hook for the cache-leak ablation: if set, evict all cached catalog metadata every N operations.
+        clear_every = int(os.environ.get('PXT_RANDOM_OPS_CLEAR_CACHE_EVERY', '100'))
+        if self._memprof is not None:
+            self._memprof.sample(iteration)  # baseline
         while True:
             self.random_op()
+            iteration += 1
+            if clear_every > 0 and iteration % clear_every == 0:
+                self._clear_catalog_caches()
+            if self._memprof is not None:
+                self._memprof.maybe_sample(iteration)
             time.sleep(random.uniform(0.1, 0.5))
+
+    @staticmethod
+    def _clear_catalog_caches() -> None:
+        """
+        Evict all cached catalog metadata (ablation hook to test the cache-leak hypothesis).
+
+        Safe only *between* operations, i.e. outside any transaction, so no in-flight code depends on the cached
+        entries. Live TableVersion instances are invalidated first, mirroring Catalog._clear_tv_cache().
+        """
+        from pixeltable.catalog.catalog import Catalog
+        from pixeltable.catalog.path import ROOT_PATH
+        from pixeltable.runtime import get_runtime
+
+        cat = get_runtime()._catalogs.get(ROOT_PATH)
+        if not isinstance(cat, Catalog):
+            return
+        for tv in cat._tbl_versions.values():
+            tv.is_validated = False
+        cat._tbl_versions.clear()
+        cat._tbls.clear()
+        cat._column_dependencies.clear()
 
 
 def run(
